@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        timezone: ["UTC", "Asia/Shanghai", "America/New_York", "Europe/London"]
+    env:
+      TZ: ${{ matrix.timezone }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff check
+        run: ruff check credential_rotation/ tests/
+
+      - name: Ruff format check
+        run: ruff format --check credential_rotation/ tests/
+
+      - name: MyPy
+        run: mypy credential_rotation/
+        continue-on-error: true
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        timezone: ["UTC", "Asia/Shanghai", "America/New_York"]
+    env:
+      TZ: ${{ matrix.timezone }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short -m "not remote and not vault_cloud"
+
+      - name: Run timezone drift tests
+        run: pytest tests/ -v -m "timezone"
+
+      - name: Run leap year tests
+        run: pytest tests/ -v -m "leap_year"
+
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.1

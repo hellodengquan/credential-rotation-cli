@@ -4,6 +4,7 @@ credential_rotation/cli.py
 credential_rotation/exporter.py
 credential_rotation/importer.py
 credential_rotation/models.py
+credential_rotation/remote.py
 credential_rotation/rotation.py
 credential_rotation/storage.py
 credential_rotation/vault.py
@@ -13,3 +14,4 @@ credential_rotation.egg-info/dependency_links.txt
 credential_rotation.egg-info/entry_points.txt
 credential_rotation.egg-info/requires.txt
 credential_rotation.egg-info/top_level.txt
+tests/test_credential_rotation.py

@@ -1,7 +1,10 @@
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict
+import json
+import os
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 from enum import Enum
+from pathlib import Path
+from typing import Optional
 
 
 class CredentialStatus(str, Enum):
@@ -11,7 +14,7 @@ class CredentialStatus(str, Enum):
     ROTATED = "rotated"
 
 
-CREDENTIAL_TYPE_CONFIGS: Dict[str, Dict[str, int]] = {
+_DEFAULT_TYPE_CONFIGS: dict[str, dict[str, int]] = {
     "api_key": {"rotation_period_days": 90, "warning_days": 14},
     "password": {"rotation_period_days": 60, "warning_days": 7},
     "token": {"rotation_period_days": 30, "warning_days": 7},
@@ -22,9 +25,93 @@ CREDENTIAL_TYPE_CONFIGS: Dict[str, Dict[str, int]] = {
     "service_account": {"rotation_period_days": 90, "warning_days": 14},
 }
 
+TYPE_CONFIG_DESCRIPTIONS: dict[str, str] = {
+    "api_key": "通用 API 密钥 (AK/SK)",
+    "password": "账户密码，泄漏风险高",
+    "token": "临时访问令牌 (JWT/OAuth)",
+    "certificate": "SSL/TLS 证书，发布周期长",
+    "ssh_key": "SSH 公私钥",
+    "oauth": "OAuth 客户端凭据",
+    "database_credential": "数据库账号/密码",
+    "service_account": "云服务账号密钥",
+}
 
-def get_type_config(cred_type: str) -> Dict[str, int]:
-    return CREDENTIAL_TYPE_CONFIGS.get(cred_type, CREDENTIAL_TYPE_CONFIGS["api_key"])
+CUSTOM_CONFIG_PATH = Path(
+    os.environ.get(
+        "CREDROT_TYPE_CONFIG", str(Path.home() / ".credential_rotation" / "type_configs.json")
+    )
+)
+
+
+class TypeConfigRegistry:
+    def __init__(self):
+        self._configs: dict[str, dict[str, int]] = dict(_DEFAULT_TYPE_CONFIGS)
+        self._load_custom()
+
+    def _load_custom(self) -> None:
+        if CUSTOM_CONFIG_PATH.exists():
+            try:
+                with open(CUSTOM_CONFIG_PATH, encoding="utf-8") as f:
+                    custom = json.load(f)
+                if isinstance(custom, dict):
+                    for k, v in custom.items():
+                        if (
+                            isinstance(v, dict)
+                            and "rotation_period_days" in v
+                            and "warning_days" in v
+                        ):
+                            self._configs[k] = {
+                                "rotation_period_days": int(v["rotation_period_days"]),
+                                "warning_days": int(v["warning_days"]),
+                            }
+            except Exception:
+                pass
+
+    def get(self, cred_type: str) -> dict[str, int]:
+        return self._configs.get(
+            cred_type,
+            self._configs.get("api_key", {"rotation_period_days": 90, "warning_days": 14}),
+        )
+
+    def register(self, cred_type: str, rotation_period_days: int, warning_days: int) -> None:
+        self._configs[cred_type] = {
+            "rotation_period_days": rotation_period_days,
+            "warning_days": warning_days,
+        }
+
+    def unregister(self, cred_type: str) -> bool:
+        if cred_type in self._configs and cred_type not in _DEFAULT_TYPE_CONFIGS:
+            del self._configs[cred_type]
+            return True
+        return False
+
+    def save_custom(self) -> Path:
+        custom = {k: v for k, v in self._configs.items() if k not in _DEFAULT_TYPE_CONFIGS}
+        CUSTOM_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CUSTOM_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(custom, f, indent=2, ensure_ascii=False)
+        return CUSTOM_CONFIG_PATH
+
+    def list_all(self) -> dict[str, dict[str, int]]:
+        return dict(self._configs)
+
+    def list_custom(self) -> dict[str, dict[str, int]]:
+        return {k: v for k, v in self._configs.items() if k not in _DEFAULT_TYPE_CONFIGS}
+
+
+_type_registry = TypeConfigRegistry()
+
+
+def get_type_config(cred_type: str) -> dict[str, int]:
+    return _type_registry.get(cred_type)
+
+
+def register_type_config(cred_type: str, rotation_period_days: int, warning_days: int) -> None:
+    _type_registry.register(cred_type, rotation_period_days, warning_days)
+
+
+def get_type_registry() -> TypeConfigRegistry:
+    return _type_registry
 
 
 SENSITIVE_FIELDS = {"secret_value"}
@@ -42,10 +129,11 @@ class Credential:
     description: Optional[str] = None
     owner: Optional[str] = None
     service: Optional[str] = None
+    environment: Optional[str] = None
     secret_value: Optional[str] = None
     last_rotated_at: Optional[datetime] = None
     status: CredentialStatus = CredentialStatus.ACTIVE
-    tags: List[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         if self.rotation_period_days == 0:
@@ -78,6 +166,7 @@ class Credential:
             data["last_rotated_at"] = datetime.fromisoformat(data["last_rotated_at"])
         data.setdefault("secret_value", None)
         data.setdefault("service", None)
+        data.setdefault("environment", None)
         rotation_period_days = data.get("rotation_period_days", 0)
         warning_days = data.get("warning_days", 0)
         if rotation_period_days == 0:

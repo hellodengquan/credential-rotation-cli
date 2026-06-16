@@ -1,10 +1,9 @@
 import json
-from pathlib import Path
-from typing import List, Optional, Dict
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
-from .models import Credential, CredentialStatus, SENSITIVE_FIELDS
-
+from .models import SENSITIVE_FIELDS, Credential, CredentialStatus
 
 DEFAULT_STORAGE_PATH = Path.home() / ".credential_rotation" / "credentials.json"
 
@@ -12,6 +11,7 @@ DEFAULT_STORAGE_PATH = Path.home() / ".credential_rotation" / "credentials.json"
 def _encrypt_field(value: str, credential_id: str, field_name: str) -> str:
     try:
         import keyring
+
         keyring.set_password(
             "credential-rotation",
             f"{credential_id}:{field_name}",
@@ -27,9 +27,13 @@ def _decrypt_field(stored_value: str) -> str:
         return stored_value
     try:
         import keyring
+
         parts = stored_value.split(":", 2)
         if len(parts) == 3:
-            return keyring.get_password("credential-rotation", f"{parts[1]}:{parts[2]}") or stored_value
+            return (
+                keyring.get_password("credential-rotation", f"{parts[1]}:{parts[2]}")
+                or stored_value
+            )
     except Exception:
         pass
     return stored_value
@@ -49,14 +53,14 @@ class Storage:
         self.use_keyring = use_keyring
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _load_all(self) -> List[dict]:
+    def _load_all(self) -> list[dict]:
         if not self.storage_path.exists():
             return []
-        with open(self.storage_path, "r", encoding="utf-8") as f:
+        with open(self.storage_path, encoding="utf-8") as f:
             data = json.load(f)
-        return data.get("credentials", [])
+        return data.get("credentials", [])  # type: ignore[no-any-return]
 
-    def _save_all(self, credentials: List[Credential]):
+    def _save_all(self, credentials: list[Credential]):
         items = []
         for c in credentials:
             d = c.to_dict(include_sensitive=True)
@@ -87,7 +91,7 @@ class Storage:
                 raw[field_name] = _decrypt_field(str(val))
         return raw
 
-    def list_all(self) -> List[Credential]:
+    def list_all(self) -> list[Credential]:
         raw = self._load_all()
         result = []
         for item in raw:
@@ -141,7 +145,7 @@ class Storage:
         cred.status = CredentialStatus.ROTATED
         return self.update(cred)
 
-    def bulk_add(self, credentials: List[Credential]) -> List[Credential]:
+    def bulk_add(self, credentials: list[Credential]) -> list[Credential]:
         existing_ids = {c.id for c in self.list_all()}
         added = []
         for cred in credentials:
