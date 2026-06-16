@@ -2,6 +2,7 @@ import csv
 import json
 from pathlib import Path
 from typing import List, Dict
+from datetime import datetime
 
 
 def export_to_json(rotation_list: List[Dict], output_path: Path) -> Path:
@@ -9,6 +10,20 @@ def export_to_json(rotation_list: List[Dict], output_path: Path) -> Path:
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(rotation_list, f, indent=2, ensure_ascii=False)
     return output_path
+
+
+def _flatten_conflict(item: Dict) -> Dict:
+    row = dict(item)
+    conflict = row.pop("conflict", None)
+    if isinstance(conflict, dict):
+        row["has_conflict"] = conflict.get("has_conflict", False)
+        row["conflicting_ids"] = ";".join(conflict.get("conflicting_ids", []))
+        row["conflict_details"] = conflict.get("details", "")
+    else:
+        row["has_conflict"] = False
+        row["conflicting_ids"] = ""
+        row["conflict_details"] = ""
+    return row
 
 
 def export_to_csv(rotation_list: List[Dict], output_path: Path) -> Path:
@@ -21,16 +36,18 @@ def export_to_csv(rotation_list: List[Dict], output_path: Path) -> Path:
     fieldnames = [
         "id", "name", "type", "owner", "status",
         "expires_at", "days_until_expiry", "rotation_period_days",
-        "warning_days", "action", "last_rotated_at", "description", "tags"
+        "warning_days", "action", "last_rotated_at", "description", "tags",
+        "service", "has_conflict", "conflicting_ids", "conflict_details",
     ]
 
     with open(output_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for item in rotation_list:
-            row = dict(item)
+            row = _flatten_conflict(item)
             if isinstance(row.get("tags"), list):
                 row["tags"] = ";".join(row["tags"])
+            row.setdefault("service", "")
             writer.writerow(row)
     return output_path
 
@@ -40,7 +57,7 @@ def export_to_markdown(rotation_list: List[Dict], output_path: Path) -> Path:
     lines = []
     lines.append("# 凭证轮换清单")
     lines.append("")
-    lines.append(f"生成时间: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
 
     if not rotation_list:
@@ -49,20 +66,95 @@ def export_to_markdown(rotation_list: List[Dict], output_path: Path) -> Path:
         lines.append(f"共 **{len(rotation_list)}** 个凭证需要关注。")
         lines.append("")
 
-        lines.append("| ID | 名称 | 类型 | 状态 | 到期时间 | 剩余天数 | 建议操作 | 负责人 |")
-        lines.append("|-----|------|------|------|----------|----------|----------|--------|")
+        lines.append("| ID | 名称 | 类型 | 状态 | 到期时间 | 剩余天数 | 建议操作 | 负责人 | 服务 | 冲突 |")
+        lines.append("|-----|------|------|------|----------|----------|----------|--------|------|------|")
 
         for item in rotation_list:
             status = _translate_status(item["status"])
             action = _translate_action(item["action"])
+            conflict_info = item.get("conflict", {})
+            if isinstance(conflict_info, dict) and conflict_info.get("has_conflict"):
+                conflict_text = "⚠ " + ", ".join(conflict_info.get("conflicting_ids", []))
+            else:
+                conflict_text = "-"
             lines.append(
                 f"| {item['id']} | {item['name']} | {item['type']} | {status} | "
                 f"{item['expires_at'][:10]} | {item['days_until_expiry']} | "
-                f"{action} | {item['owner'] or '-'} |"
+                f"{action} | {item['owner'] or '-'} | {item.get('service', '-') or '-'} | {conflict_text} |"
             )
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+    return output_path
+
+
+def export_to_ical(rotation_list: List[Dict], output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    lines.append("BEGIN:VCALENDAR")
+    lines.append("VERSION:2.0")
+    lines.append("PRODID:-//Credential Rotation Manager//CN")
+    lines.append("CALSCALE:GREGORIAN")
+    lines.append("METHOD:PUBLISH")
+
+    for item in rotation_list:
+        expires_str = item.get("expires_at", "")
+        try:
+            expires_dt = datetime.fromisoformat(expires_str)
+        except (ValueError, TypeError):
+            continue
+
+        dt_start = expires_dt.strftime("%Y%m%d")
+        dt_stamp = datetime.now().strftime("%Y%m%dT%H%M%SZ")
+
+        uid = f"{item['id']}@credential-rotation"
+        status = _translate_status(item.get("status", ""))
+        action = _translate_action(item.get("action", ""))
+        summary = f"[{status}] {item['name']} ({item['type']}) 到期"
+        description_parts = [
+            f"凭证ID: {item['id']}",
+            f"类型: {item['type']}",
+            f"状态: {status}",
+            f"剩余天数: {item.get('days_until_expiry', 'N/A')}",
+            f"建议操作: {action}",
+            f"负责人: {item.get('owner') or 'N/A'}",
+            f"服务: {item.get('service') or 'N/A'}",
+        ]
+        conflict_info = item.get("conflict", {})
+        if isinstance(conflict_info, dict) and conflict_info.get("has_conflict"):
+            conflicting = ", ".join(conflict_info.get("conflicting_ids", []))
+            description_parts.append(f"并发轮换冲突: {conflicting}")
+            if conflict_info.get("details"):
+                description_parts.append(f"冲突详情: {conflict_info['details']}")
+        desc_text = "\\n".join(description_parts)
+
+        lines.append("BEGIN:VEVENT")
+        lines.append(f"UID:{uid}")
+        lines.append(f"DTSTAMP:{dt_stamp}")
+        lines.append(f"DTSTART;VALUE=DATE:{dt_start}")
+        lines.append(f"SUMMARY:{summary}")
+        lines.append(f"DESCRIPTION:{desc_text}")
+        lines.append("BEGIN:VALARM")
+        lines.append("TRIGGER:-P14D")
+        lines.append("ACTION:DISPLAY")
+        lines.append(f"DESCRIPTION:凭证 {item['name']} 将在 14 天后到期")
+        lines.append("END:VALARM")
+        lines.append("BEGIN:VALARM")
+        lines.append("TRIGGER:-P7D")
+        lines.append("ACTION:DISPLAY")
+        lines.append(f"DESCRIPTION:凭证 {item['name']} 将在 7 天后到期")
+        lines.append("END:VALARM")
+        lines.append("BEGIN:VALARM")
+        lines.append("TRIGGER:-P1D")
+        lines.append("ACTION:DISPLAY")
+        lines.append(f"DESCRIPTION:凭证 {item['name']} 明天到期！")
+        lines.append("END:VALARM")
+        lines.append("END:VEVENT")
+
+    lines.append("END:VCALENDAR")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\r\n".join(lines))
     return output_path
 
 

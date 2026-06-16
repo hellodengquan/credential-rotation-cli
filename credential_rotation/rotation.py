@@ -1,5 +1,6 @@
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from enum import Enum
 
 from .models import Credential, CredentialStatus
@@ -11,6 +12,17 @@ class RotationAction(str, Enum):
     SCHEDULE_SOON = "schedule_soon"
     MONITOR = "monitor"
     NO_ACTION = "no_action"
+
+
+CONCURRENT_ROTATION_WINDOW_DAYS = 1
+
+
+@dataclass
+class RotationConflict:
+    credential_id: str
+    conflicting_ids: List[str]
+    service: Optional[str]
+    details: str
 
 
 class RotationManager:
@@ -59,11 +71,65 @@ class RotationManager:
             return RotationAction.SCHEDULE_SOON
         return RotationAction.MONITOR
 
-    def generate_rotation_list(self, include_expired: bool = True, include_expiring: bool = True,
-                               include_active: bool = False) -> List[Dict]:
+    def detect_concurrent_rotation_conflicts(
+        self,
+        credentials: Optional[List[Credential]] = None,
+        window_days: int = CONCURRENT_ROTATION_WINDOW_DAYS,
+    ) -> List[RotationConflict]:
+        creds = credentials or self.get_all_credentials()
+        conflicts: List[RotationConflict] = []
+
+        by_service: Dict[str, List[Credential]] = {}
+        for cred in creds:
+            if cred.status == CredentialStatus.ROTATED:
+                continue
+            svc = cred.service or "_no_service_"
+            by_service.setdefault(svc, []).append(cred)
+
+        for svc, svc_creds in by_service.items():
+            if len(svc_creds) < 2:
+                continue
+
+            svc_creds_sorted = sorted(svc_creds, key=lambda c: c.expires_at)
+            for i in range(len(svc_creds_sorted)):
+                cred = svc_creds_sorted[i]
+                conflicting: List[str] = []
+                for j in range(len(svc_creds_sorted)):
+                    if i == j:
+                        continue
+                    other = svc_creds_sorted[j]
+                    delta_days = abs((cred.expires_at - other.expires_at).days)
+                    if delta_days <= window_days:
+                        conflicting.append(other.id)
+                if conflicting:
+                    details = (
+                        f"同服务 {svc} 下有 {len(conflicting)} 个凭证到期时间差 <= {window_days} 天, "
+                        f"并发轮换风险高 (建议间隔 > {window_days} 天)"
+                    )
+                    conflicts.append(RotationConflict(
+                        credential_id=cred.id,
+                        conflicting_ids=conflicting,
+                        service=None if svc == "_no_service_" else svc,
+                        details=details,
+                    ))
+
+        return conflicts
+
+    def generate_rotation_list(
+        self,
+        include_expired: bool = True,
+        include_expiring: bool = True,
+        include_active: bool = False,
+        check_conflicts: bool = True,
+    ) -> List[Dict]:
         creds = self.get_all_credentials()
         now = datetime.now()
         rotation_list = []
+
+        conflicts_map: Dict[str, RotationConflict] = {}
+        if check_conflicts:
+            for conf in self.detect_concurrent_rotation_conflicts(creds):
+                conflicts_map[conf.credential_id] = conf
 
         for cred in creds:
             status = cred.status
@@ -78,7 +144,8 @@ class RotationManager:
 
             if should_include:
                 action = self.get_action_for_credential(cred, now)
-                rotation_list.append({
+                conflict = conflicts_map.get(cred.id)
+                entry = {
                     "id": cred.id,
                     "name": cred.name,
                     "type": cred.type,
@@ -92,7 +159,18 @@ class RotationManager:
                     "last_rotated_at": cred.last_rotated_at.isoformat() if cred.last_rotated_at else None,
                     "description": cred.description or "",
                     "tags": cred.tags,
-                })
+                    "service": cred.service or "",
+                    "conflict": {
+                        "has_conflict": True,
+                        "conflicting_ids": conflict.conflicting_ids,
+                        "details": conflict.details,
+                    } if conflict else {
+                        "has_conflict": False,
+                        "conflicting_ids": [],
+                        "details": "",
+                    },
+                }
+                rotation_list.append(entry)
 
         rotation_list.sort(key=lambda x: x["expires_at"])
         return rotation_list
@@ -118,6 +196,8 @@ class RotationManager:
             "expired": 0,
             "rotated": 0,
             "by_type": {},
+            "by_service": {},
+            "conflicts": len(self.detect_concurrent_rotation_conflicts(creds)),
         }
         for cred in creds:
             status = cred.status.value
@@ -126,4 +206,8 @@ class RotationManager:
             if cred.type not in stats["by_type"]:
                 stats["by_type"][cred.type] = 0
             stats["by_type"][cred.type] += 1
+            svc = cred.service or "(未指定)"
+            if svc not in stats["by_service"]:
+                stats["by_service"][svc] = 0
+            stats["by_service"][svc] += 1
         return stats

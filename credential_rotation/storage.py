@@ -1,18 +1,52 @@
 import json
-import os
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime
 
-from .models import Credential, CredentialStatus
+from .models import Credential, CredentialStatus, SENSITIVE_FIELDS
 
 
 DEFAULT_STORAGE_PATH = Path.home() / ".credential_rotation" / "credentials.json"
 
 
+def _encrypt_field(value: str, credential_id: str, field_name: str) -> str:
+    try:
+        import keyring
+        keyring.set_password(
+            "credential-rotation",
+            f"{credential_id}:{field_name}",
+            value,
+        )
+        return f"ENCRYPTED:{credential_id}:{field_name}"
+    except Exception:
+        return value
+
+
+def _decrypt_field(stored_value: str) -> str:
+    if not stored_value.startswith("ENCRYPTED:"):
+        return stored_value
+    try:
+        import keyring
+        parts = stored_value.split(":", 2)
+        if len(parts) == 3:
+            return keyring.get_password("credential-rotation", f"{parts[1]}:{parts[2]}") or stored_value
+    except Exception:
+        pass
+    return stored_value
+
+
+def _is_encrypted(value: str) -> bool:
+    return isinstance(value, str) and value.startswith("ENCRYPTED:")
+
+
 class Storage:
-    def __init__(self, storage_path: Optional[Path] = None):
+    def __init__(
+        self,
+        storage_path: Optional[Path] = None,
+        use_keyring: bool = False,
+    ):
         self.storage_path = storage_path or DEFAULT_STORAGE_PATH
+        self.use_keyring = use_keyring
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _load_all(self) -> List[dict]:
@@ -23,17 +57,44 @@ class Storage:
         return data.get("credentials", [])
 
     def _save_all(self, credentials: List[Credential]):
+        items = []
+        for c in credentials:
+            d = c.to_dict(include_sensitive=True)
+            if self.use_keyring:
+                for field_name in SENSITIVE_FIELDS:
+                    val = d.get(field_name)
+                    if val and not _is_encrypted(str(val)):
+                        d[field_name] = _encrypt_field(str(val), c.id, field_name)
+            else:
+                for field_name in SENSITIVE_FIELDS:
+                    d.pop(field_name, None)
+            items.append(d)
+
         data = {
             "version": "1.0",
+            "encrypted": self.use_keyring,
             "updated_at": datetime.now().isoformat(),
-            "credentials": [c.to_dict() for c in credentials]
+            "credentials": items,
         }
         with open(self.storage_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
+    def _decrypt_credential(self, raw: dict) -> dict:
+        raw = dict(raw)
+        for field_name in SENSITIVE_FIELDS:
+            val = raw.get(field_name)
+            if val and _is_encrypted(str(val)):
+                raw[field_name] = _decrypt_field(str(val))
+        return raw
+
     def list_all(self) -> List[Credential]:
         raw = self._load_all()
-        return [Credential.from_dict(item) for item in raw]
+        result = []
+        for item in raw:
+            if self.use_keyring:
+                item = self._decrypt_credential(item)
+            result.append(Credential.from_dict(item))
+        return result
 
     def get_by_id(self, credential_id: str) -> Optional[Credential]:
         for cred in self.list_all():
@@ -79,3 +140,16 @@ class Storage:
         cred.last_rotated_at = rotated_at
         cred.status = CredentialStatus.ROTATED
         return self.update(cred)
+
+    def bulk_add(self, credentials: List[Credential]) -> List[Credential]:
+        existing_ids = {c.id for c in self.list_all()}
+        added = []
+        for cred in credentials:
+            if cred.id in existing_ids:
+                continue
+            added.append(cred)
+            existing_ids.add(cred.id)
+        if added:
+            all_creds = self.list_all() + added
+            self._save_all(all_creds)
+        return added
