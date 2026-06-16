@@ -1,0 +1,20 @@
+[project]
+name = "credential-rotation"
+version = "0.1.0"
+description = "A CLI tool for managing credential rotation and tracking expiry windows"
+requires-python = ">=3.9"
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "python-dateutil>=2.8.0",
+]
+
+[project.scripts]
+credrot = "credential_rotation.cli:app"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["credential_rotation*"]

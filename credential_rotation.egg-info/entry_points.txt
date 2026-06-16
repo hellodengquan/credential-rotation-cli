@@ -1,0 +1,2 @@
+[console_scripts]
+credrot = credential_rotation.cli:app
