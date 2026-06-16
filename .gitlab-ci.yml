@@ -53,9 +53,23 @@ test:
 
 test_timezone:
   stage: test
+  parallel:
+    matrix:
+      - TZ: ["UTC", "Asia/Shanghai", "America/New_York", "Europe/London", "Australia/Sydney"]
   image: python:3.12-slim
   script:
+    - export TZ=$TZ
     - pytest tests/ -v -m "timezone"
+
+test_dst:
+  stage: test
+  parallel:
+    matrix:
+      - TZ: ["America/New_York", "Europe/London", "America/Los_Angeles"]
+  image: python:3.12-slim
+  script:
+    - export TZ=$TZ
+    - pytest tests/ -v -m "dst"
 
 test_leap_year:
   stage: test

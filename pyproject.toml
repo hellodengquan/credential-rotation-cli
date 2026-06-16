@@ -13,14 +13,17 @@ dependencies = [
 keyring = ["keyring>=23.0.0"]
 aws = ["boto3>=1.26.0"]
 gcp = ["google-cloud-secret-manager>=2.0.0"]
+azure = ["azure-keyvault-secrets>=4.0.0", "azure-identity>=1.12.0"]
 sftp = ["paramiko>=3.0.0"]
 s3 = ["boto3>=1.26.0"]
 remote = ["boto3>=1.26.0", "paramiko>=3.0.0"]
-vault = ["keyring>=23.0.0", "boto3>=1.26.0", "google-cloud-secret-manager>=2.0.0"]
+vault = ["keyring>=23.0.0", "boto3>=1.26.0", "google-cloud-secret-manager>=2.0.0", "azure-keyvault-secrets>=4.0.0", "azure-identity>=1.12.0"]
 all = [
     "keyring>=23.0.0",
     "boto3>=1.26.0",
     "google-cloud-secret-manager>=2.0.0",
+    "azure-keyvault-secrets>=4.0.0",
+    "azure-identity>=1.12.0",
     "paramiko>=3.0.0",
 ]
 dev = [
@@ -95,6 +98,8 @@ module = [
     "keyring.*",
     "google.cloud.*",
     "google.protobuf.*",
+    "azure.identity.*",
+    "azure.keyvault.*",
     "paramiko.*",
     "rich.*",
     "typer.*",
@@ -107,6 +112,7 @@ python_files = ["test_*.py"]
 addopts = "-v --tb=short"
 markers = [
     "timezone: marks tests for timezone drift",
+    "dst: marks tests for daylight saving time boundaries",
     "leap_year: marks tests for leap year edge cases",
     "remote: marks tests for remote fetching (may need network)",
     "vault_cloud: marks tests for cloud vault backends (need credentials)",

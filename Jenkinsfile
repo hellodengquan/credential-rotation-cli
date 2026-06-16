@@ -51,17 +51,27 @@ pipeline {
                 axes {
                     axis {
                         name 'TZ'
-                        values 'UTC', 'Asia/Shanghai', 'America/New_York'
+                        values 'UTC', 'Asia/Shanghai', 'America/New_York', 'Europe/London', 'Australia/Sydney'
+                    }
+                    axis {
+                        name 'PYTHON_VERSION'
+                        values '3.10', '3.12'
                     }
                 }
                 stages {
                     stage('Test') {
+                        agent {
+                            docker {
+                                image "python:${PYTHON_VERSION}-slim"
+                            }
+                        }
                         steps {
                             sh """
+                                pip install -e ".[dev]"
                                 export TZ=\$TZ
-                                echo "Running tests with TZ=\$TZ"
-                                pytest tests/ -v --tb=short -m "not remote and not vault_cloud" \
-                                    --junitxml=test-results-\$TZ.xml
+                                echo "Running tests with Python ${PYTHON_VERSION}, TZ=\$TZ"
+                                pytest tests/ -v --tb=short -m "not remote and not vault_cloud" \\
+                                    --junitxml=test-results-\$TZ-py${PYTHON_VERSION}.xml
                             """
                         }
                         post {
@@ -75,12 +85,53 @@ pipeline {
         }
 
         stage('Timezone Drift Tests') {
-            steps {
-                sh 'pytest tests/ -v -m "timezone" --junitxml=test-timezone.xml'
+            matrix {
+                axes {
+                    axis {
+                        name 'TZ'
+                        values 'UTC', 'Asia/Shanghai', 'America/New_York'
+                    }
+                }
+                stages {
+                    stage('TZ Drift') {
+                        steps {
+                            sh """
+                                export TZ=\$TZ
+                                pytest tests/ -v -m "timezone" --junitxml=test-timezone-\$TZ.xml
+                            """
+                        }
+                    }
+                }
             }
             post {
                 always {
-                    junit 'test-timezone.xml'
+                    junit 'test-timezone-*.xml'
+                }
+            }
+        }
+
+        stage('DST Tests') {
+            matrix {
+                axes {
+                    axis {
+                        name 'TZ'
+                        values 'America/New_York', 'Europe/London', 'America/Los_Angeles'
+                    }
+                }
+                stages {
+                    stage('DST') {
+                        steps {
+                            sh """
+                                export TZ=\$TZ
+                                pytest tests/ -v -m "dst" --junitxml=test-dst-\$TZ.xml
+                            """
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    junit 'test-dst-*.xml'
                 }
             }
         }

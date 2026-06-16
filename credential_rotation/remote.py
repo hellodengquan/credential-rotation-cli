@@ -1,10 +1,12 @@
 import tempfile
 from abc import ABC, abstractmethod
 from contextlib import suppress
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+DEFAULT_CLOCK_DRIFT_TOLERANCE = timedelta(minutes=5)
 
 
 @dataclass
@@ -13,6 +15,40 @@ class RemoteFetchResult:
     last_modified: Optional[datetime]
     was_updated: bool
     etag: Optional[str] = None
+    clock_drift_detected: bool = False
+    clock_drift_delta: Optional[timedelta] = None
+
+
+@dataclass
+class ClockDriftConfig:
+    tolerance: timedelta = field(default_factory=lambda: DEFAULT_CLOCK_DRIFT_TOLERANCE)
+    force_fetch_on_drift: bool = True
+    max_drift: timedelta = field(default_factory=lambda: timedelta(hours=1))
+    last_remote_time: Optional[datetime] = None
+    last_local_time: Optional[datetime] = None
+
+    def check_drift(
+        self, remote_time: Optional[datetime], local_time: Optional[datetime] = None
+    ) -> tuple[bool, Optional[timedelta]]:
+        if remote_time is None:
+            return False, None
+        local_now = local_time or datetime.now(timezone.utc)
+        if remote_time.tzinfo is None:
+            remote_time = remote_time.replace(tzinfo=timezone.utc)
+        if local_now.tzinfo is None:
+            local_now = local_now.replace(tzinfo=timezone.utc)
+        self.last_remote_time = remote_time
+        self.last_local_time = local_now
+        delta = remote_time - local_now
+        abs_delta = abs(delta)
+        if abs_delta > self.tolerance:
+            return True, delta
+        return False, None
+
+    def is_drift_acceptable(self, delta: Optional[timedelta]) -> bool:
+        if delta is None:
+            return True
+        return abs(delta) <= self.max_drift
 
 
 class RemoteFetcher(ABC):
@@ -30,8 +66,36 @@ class RemoteFetcher(ABC):
         remote_path: str,
         since: Optional[datetime] = None,
         local_etag: Optional[str] = None,
+        clock_drift_config: Optional[ClockDriftConfig] = None,
     ) -> Optional[RemoteFetchResult]:
         last_mod = self.get_last_modified(remote_path)
+        clock_drift_detected = False
+        clock_drift_delta: Optional[timedelta] = None
+
+        if clock_drift_config and last_mod:
+            clock_drift_detected, clock_drift_delta = clock_drift_config.check_drift(last_mod)
+            if clock_drift_detected and not clock_drift_config.is_drift_acceptable(
+                clock_drift_delta
+            ):
+                return RemoteFetchResult(
+                    local_path=Path(""),
+                    last_modified=last_mod,
+                    was_updated=False,
+                    clock_drift_detected=True,
+                    clock_drift_delta=clock_drift_delta,
+                )
+            if clock_drift_detected and clock_drift_config.force_fetch_on_drift:
+                local_path = self.fetch(remote_path)
+                etag = getattr(self, "_last_etag", None)
+                return RemoteFetchResult(
+                    local_path=local_path,
+                    last_modified=last_mod,
+                    was_updated=True,
+                    etag=etag,
+                    clock_drift_detected=True,
+                    clock_drift_delta=clock_drift_delta,
+                )
+
         if since and last_mod and last_mod <= since:
             return RemoteFetchResult(
                 local_path=Path(""),
@@ -39,14 +103,14 @@ class RemoteFetcher(ABC):
                 was_updated=False,
             )
         local_path = self.fetch(remote_path)
-        etag = None
-        if hasattr(self, "_last_etag"):
-            etag = getattr(self, "_last_etag", None)
+        etag = getattr(self, "_last_etag", None)
         return RemoteFetchResult(
             local_path=local_path,
             last_modified=last_mod,
             was_updated=True,
             etag=etag,
+            clock_drift_detected=clock_drift_detected,
+            clock_drift_delta=clock_drift_delta,
         )
 
 
@@ -251,6 +315,7 @@ def fetch_remote_incremental(
     remote_path: str,
     since: Optional[datetime] = None,
     local_etag: Optional[str] = None,
+    clock_drift_config: Optional[ClockDriftConfig] = None,
     **kwargs,
 ) -> Optional[RemoteFetchResult]:
     scheme = remote_path.split("://", 1)[0].lower()
@@ -261,7 +326,12 @@ def fetch_remote_incremental(
         )
     fetcher = fetcher_cls(**kwargs)
     try:
-        return fetcher.fetch_if_newer(remote_path, since=since, local_etag=local_etag)
+        return fetcher.fetch_if_newer(
+            remote_path,
+            since=since,
+            local_etag=local_etag,
+            clock_drift_config=clock_drift_config,
+        )
     finally:
         if hasattr(fetcher, "close"):
             with suppress(Exception):

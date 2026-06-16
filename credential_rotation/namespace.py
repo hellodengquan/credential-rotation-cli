@@ -1,11 +1,16 @@
 import hashlib
+import json
+import os
 import re
+import secrets
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 NAMESPACE_SEPARATOR = "::"
 NAMESPACE_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
 MAX_NAMESPACE_LENGTH = 63
+KEY_ROTATION_LOG_ENV = "CREDROT_KEY_ROTATION_LOG"
 
 
 @dataclass
@@ -153,3 +158,91 @@ class VaultNamespaceAdapter:
             if info.namespace == self._namespace:
                 result.append(info.resource_id)
         return result
+
+
+@dataclass
+class KeyRotationRecord:
+    namespace: str
+    old_key_hash: str
+    new_key_hash: str
+    rotated_at: str
+    rotated_by: str
+    affected_credentials: int
+    reason: str
+
+
+class NamespaceKeyManager:
+    def __init__(
+        self,
+        vault_backend,
+        key_store_path: Optional[str] = None,
+    ):
+        self._vault = vault_backend
+        self._key_store_path = key_store_path or os.environ.get(
+            KEY_ROTATION_LOG_ENV,
+            str(os.path.expanduser("~/.credential_rotation/key_rotation_log.json")),
+        )
+        self._rotation_log: list[KeyRotationRecord] = []
+        self._load_rotation_log()
+
+    def _load_rotation_log(self) -> None:
+        path = self._key_store_path
+        if path and os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    for entry in data:
+                        self._rotation_log.append(KeyRotationRecord(**entry))
+            except Exception:
+                pass
+
+    def _save_rotation_log(self) -> None:
+        if not self._key_store_path:
+            return
+        os.makedirs(os.path.dirname(self._key_store_path), exist_ok=True)
+        with open(self._key_store_path, "w", encoding="utf-8") as f:
+            json.dump(
+                [vars(r) for r in self._rotation_log],
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+    @staticmethod
+    def _hash_key(key: str) -> str:
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+    def rotate_namespace_key(
+        self,
+        namespace: str,
+        old_key: str,
+        reason: str = "key_compromised",
+    ) -> KeyRotationRecord:
+        if not validate_namespace(namespace):
+            raise NamespaceSecurityError(f"Invalid namespace: {namespace}")
+        adapter = VaultNamespaceAdapter(self._vault, namespace=namespace)
+        affected_ids = adapter.list_ids()
+        new_key = secrets.token_urlsafe(48)
+        old_hash = self._hash_key(old_key)
+        new_hash = self._hash_key(new_key)
+        record = KeyRotationRecord(
+            namespace=namespace,
+            old_key_hash=old_hash,
+            new_key_hash=new_hash,
+            rotated_at=datetime.now(timezone.utc).isoformat(),
+            rotated_by=os.environ.get("USER", "unknown"),
+            affected_credentials=len(affected_ids),
+            reason=reason,
+        )
+        self._rotation_log.append(record)
+        self._save_rotation_log()
+        return record
+
+    def get_rotation_history(self, namespace: Optional[str] = None) -> list[KeyRotationRecord]:
+        if namespace is None:
+            return list(self._rotation_log)
+        return [r for r in self._rotation_log if r.namespace == namespace]
+
+    def check_key_compromised(self, key_hash: str) -> list[KeyRotationRecord]:
+        return [r for r in self._rotation_log if r.old_key_hash == key_hash]

@@ -10,7 +10,7 @@ def _build_rrule(
     interval: int = 1,
     count: Optional[int] = None,
     until: Optional[datetime] = None,
-    by_month: Optional[int] = None,
+    by_month: Optional[str] = None,
     by_day: Optional[str] = None,
 ) -> str:
     parts = [f"FREQ={freq}", f"INTERVAL={interval}"]
@@ -48,6 +48,13 @@ def generate_rrule_from_rotation_days(rotation_days: int) -> str:
     if rotation_days >= 365 and rotation_days % 365 == 0:
         years = rotation_days // 365
         return _build_rrule(freq="YEARLY", interval=years)
+    if rotation_days >= 90 and rotation_days % 90 == 0:
+        quarters = rotation_days // 90
+        return (
+            _build_rrule(freq="YEARLY", interval=1, by_month="1,4,7,10")
+            if quarters == 1
+            else _build_rrule(freq="MONTHLY", interval=3)
+        )
     if rotation_days >= 30 and rotation_days % 30 == 0:
         months = rotation_days // 30
         return _build_rrule(freq="MONTHLY", interval=months)
@@ -55,6 +62,62 @@ def generate_rrule_from_rotation_days(rotation_days: int) -> str:
         weeks = rotation_days // 7
         return _build_rrule(freq="WEEKLY", interval=weeks)
     return _build_rrule(freq="DAILY", interval=rotation_days)
+
+
+def generate_weekly_rrule(
+    interval: int = 1,
+    by_day: str = "MO",
+    count: Optional[int] = None,
+    until: Optional[datetime] = None,
+) -> str:
+    return _build_rrule(freq="WEEKLY", interval=interval, by_day=by_day, count=count, until=until)
+
+
+def generate_quarterly_rrule(
+    by_month: str = "1,4,7,10",
+    interval: int = 1,
+    count: Optional[int] = None,
+    until: Optional[datetime] = None,
+) -> str:
+    return _build_rrule(
+        freq="YEARLY", interval=interval, by_month=by_month, count=count, until=until
+    )
+
+
+def generate_composite_recurrence_sample(
+    start_date: datetime,
+    weekly_interval: int = 2,
+    quarterly_months: str = "1,4,7,10",
+    years: int = 3,
+) -> dict:
+    weekly_rrule = generate_weekly_rrule(interval=weekly_interval)
+    quarterly_rrule = generate_quarterly_rrule(by_month=quarterly_months)
+
+    weekly_dates: list[datetime] = []
+    current = start_date
+    end = start_date.replace(year=start_date.year + years)
+    while current <= end:
+        weekly_dates.append(current)
+        current = current + timedelta(weeks=weekly_interval)
+
+    quarterly_dates: list[datetime] = []
+    months = [int(m) for m in quarterly_months.split(",")]
+    for y in range(start_date.year, start_date.year + years + 1):
+        for m in months:
+            d = datetime(y, m, start_date.day, start_date.hour, start_date.minute)
+            if d >= start_date and d <= end:
+                quarterly_dates.append(d)
+
+    return {
+        "start_date": start_date.isoformat(),
+        "weekly_rrule": weekly_rrule,
+        "quarterly_rrule": quarterly_rrule,
+        "weekly_events": len(weekly_dates),
+        "quarterly_events": len(quarterly_dates),
+        "weekly_first_5": [d.isoformat() for d in weekly_dates[:5]],
+        "quarterly_dates": [d.isoformat() for d in quarterly_dates],
+        "years_covered": years,
+    }
 
 
 def generate_cross_year_recurrence_sample(

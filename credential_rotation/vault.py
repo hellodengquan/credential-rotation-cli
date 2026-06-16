@@ -23,6 +23,12 @@ def detect_identity() -> IdentityType:
         uid = os.getuid()
     except AttributeError:
         return IdentityType.UNKNOWN
+    try:
+        euid = os.geteuid()
+    except AttributeError:
+        euid = uid
+    if euid == 0 and uid != 0:
+        return IdentityType.SERVICE_ACCOUNT
     if uid == 0:
         return IdentityType.ROOT
     try:
@@ -250,12 +256,33 @@ class EnvFileVaultBackend(VaultBackend):
         if vault_path is None:
             vault_path = get_vault_fallback_path(identity)
         self.vault_path = vault_path
+        self._check_effective_uid_safety()
         self.vault_path.parent.mkdir(parents=True, exist_ok=True)
         if encryption_key is None:
             encryption_key = get_vault_key_for_identity(identity)
         self._key = encryption_key or "default-key-change-me"
         self._key_bytes = self._derive_key(self._key)
         self._identity = identity or detect_identity()
+
+    @staticmethod
+    def _check_effective_uid_safety() -> None:
+        try:
+            uid = os.getuid()
+            euid = os.geteuid()
+        except AttributeError:
+            return
+        if euid == 0 and uid != 0:
+            for env_var in ("CREDROT_VAULT_KEY", "CREDROT_VAULT_KEY_ROOT", "CREDROT_VAULT_KEY_SVC"):
+                if os.environ.get(env_var):
+                    import warnings
+
+                    warnings.warn(
+                        f"setuid binary detected (uid={uid}, euid={euid}): "
+                        f"environment variable {env_var} may be visible to other users. "
+                        f"Consider using file-based key instead.",
+                        stacklevel=3,
+                    )
+                    break
 
     @staticmethod
     def _derive_key(key: str) -> bytes:
@@ -685,10 +712,188 @@ VAULT_BACKENDS: dict[str, type[VaultBackend]] = {
 }
 
 
+class AzureKeyVaultBackend(VaultBackend):
+    def __init__(
+        self,
+        vault_url: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+    ):
+        try:
+            from azure.identity import DefaultAzureCredential
+            from azure.keyvault.secrets import SecretClient
+
+            self._azure_identity = DefaultAzureCredential
+            self._secret_client_cls = SecretClient
+        except ImportError:
+            raise ImportError(
+                "azure-keyvault-secrets and azure-identity are required for AzureKeyVaultBackend. "
+                "Install with: pip install azure-keyvault-secrets azure-identity"
+            )
+        self.vault_url = vault_url or os.environ.get("AZURE_KEYVAULT_URL", "")
+        if not self.vault_url:
+            raise ValueError("vault_url must be provided or set AZURE_KEYVAULT_URL env var")
+        self.tenant_id = tenant_id or os.environ.get("AZURE_TENANT_ID")
+        self.client_id = client_id or os.environ.get("AZURE_CLIENT_ID")
+        self.client_secret = client_secret or os.environ.get("AZURE_CLIENT_SECRET")
+        self._client = None
+
+    def _get_client(self):
+        from azure.identity import DefaultAzureCredential
+        from azure.keyvault.secrets import SecretClient
+
+        if self._client is None:
+            credential = DefaultAzureCredential()
+            self._client = SecretClient(vault_url=self.vault_url, credential=credential)
+        return self._client
+
+    def store(self, credential_id: str, secret_data: dict[str, str]) -> None:
+        client = self._get_client()
+        secret_string = json.dumps(secret_data)
+        client.set_secret(credential_id, secret_string)
+
+    def retrieve(self, credential_id: str) -> Optional[dict[str, str]]:
+        client = self._get_client()
+        try:
+            secret = client.get_secret(credential_id)
+            if secret and secret.value:
+                return json.loads(secret.value)  # type: ignore[no-any-return]
+        except Exception:
+            pass
+        return None
+
+    def delete(self, credential_id: str) -> bool:
+        client = self._get_client()
+        try:
+            poller = client.begin_delete_secret(credential_id)
+            poller.wait()
+            return True
+        except Exception:
+            return False
+
+    def list_ids(self) -> list[str]:
+        client = self._get_client()
+        ids = []
+        try:
+            for secret_prop in client.list_properties_of_secrets():
+                if not secret_prop.enabled:
+                    continue
+                ids.append(secret_prop.name)
+        except Exception:
+            pass
+        return ids
+
+    def create_rotation_template(
+        self,
+        credential_id: str,
+        rotation_period_days: int,
+        rotation_lambda: Optional[str] = None,
+        **kwargs,
+    ) -> RotationTemplate:
+        client = self._get_client()
+        rotation_action = kwargs.get("rotation_action")
+        try:
+            secret = client.get_secret(credential_id)
+            props = secret.properties
+            props.expires_on = None
+            if rotation_action:
+                props.tags = dict(getattr(props, "tags", None) or {})
+                props.tags["credrot_rotation_days"] = str(rotation_period_days)
+                props.tags["credrot_rotation_enabled"] = "true"
+                if rotation_lambda:
+                    props.tags["credrot_rotation_target"] = rotation_lambda
+                props.tags["credrot_rotation_action"] = rotation_action
+            client.update_secret_properties(credential_id, properties=props)
+        except Exception:
+            pass
+        return RotationTemplate(
+            credential_id=credential_id,
+            rotation_period_days=rotation_period_days,
+            rotation_lambda=rotation_lambda,
+            enabled=True,
+            backend="azure",
+        )
+
+    def describe_rotation(self, credential_id: str) -> Optional[RotationTemplate]:
+        client = self._get_client()
+        try:
+            secret = client.get_secret(credential_id)
+            props = secret.properties
+            tags = dict(getattr(props, "tags", None) or {})
+            enabled = tags.get("credrot_rotation_enabled", "") == "true"
+            period_days = int(tags.get("credrot_rotation_days", "0") or "0")
+            rotation_target = tags.get("credrot_rotation_target")
+            created = getattr(props, "created_on", None)
+            updated = getattr(props, "updated_on", None)
+            last_rotated = None
+            next_rotation = None
+            if updated:
+                last_rotated = updated
+            if created and period_days > 0:
+                from datetime import timedelta
+
+                next_rotation = (updated or created) + timedelta(days=period_days)
+            return RotationTemplate(
+                credential_id=credential_id,
+                rotation_period_days=period_days,
+                last_rotated_at=last_rotated,
+                next_rotation_at=next_rotation,
+                rotation_lambda=rotation_target,
+                enabled=enabled,
+                backend="azure",
+            )
+        except Exception:
+            return None
+
+    def disable_rotation(self, credential_id: str) -> bool:
+        client = self._get_client()
+        try:
+            secret = client.get_secret(credential_id)
+            props = secret.properties
+            tags = dict(getattr(props, "tags", None) or {})
+            tags["credrot_rotation_enabled"] = "false"
+            props.tags = tags
+            client.update_secret_properties(credential_id, properties=props)
+            return True
+        except Exception:
+            return False
+
+    def rotate_secret(self, credential_id: str, **kwargs) -> bool:
+        import secrets as _secrets
+
+        client = self._get_client()
+        new_value = kwargs.get("new_value")
+        if new_value is None:
+            existing = self.retrieve(credential_id)
+            if existing is None:
+                return False
+            new_data = dict(existing)
+            for key in new_data:
+                if key in ("password", "secret", "api_key", "token", "value"):
+                    new_data[key] = _secrets.token_urlsafe(32)
+                    break
+            new_value = json.dumps(new_data)
+        try:
+            client.set_secret(credential_id, new_value)
+            return True
+        except Exception:
+            return False
+
+
+VAULT_BACKENDS["azure"] = AzureKeyVaultBackend
+
+
 def get_vault_backend(name: str, **kwargs) -> VaultBackend:
     cls = VAULT_BACKENDS.get(name)
     if cls is None:
         raise ValueError(
             f"Unknown vault backend '{name}'. Available: {', '.join(VAULT_BACKENDS.keys())}"
         )
-    return cls(**kwargs)
+    try:
+        return cls(**kwargs)
+    except ImportError as e:
+        raise ImportError(
+            f"Backend '{name}' requires additional dependencies: {e}. "
+            f"Install the appropriate extras (e.g. pip install credential-rotation[{name}])"
+        ) from e

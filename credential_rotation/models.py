@@ -7,6 +7,18 @@ from pathlib import Path
 from typing import Optional
 
 
+class DrainTimeoutError(RuntimeError):
+    pass
+
+
+class DrainForcedKillError(RuntimeError):
+    pass
+
+
+DEFAULT_DRAIN_TIMEOUT_SECONDS = 300
+DEFAULT_DRAIN_MAX_CREDENTIALS = 1000
+
+
 class CredentialStatus(str, Enum):
     ACTIVE = "active"
     EXPIRING_SOON = "expiring_soon"
@@ -49,6 +61,10 @@ class TypeConfigRegistry:
         self._custom_configs: dict[str, dict[str, int]] = {}
         self._custom_enabled: bool = True
         self._drain_mode: bool = False
+        self._drain_start_time: Optional[datetime] = None
+        self._drain_timeout: int = DEFAULT_DRAIN_TIMEOUT_SECONDS
+        self._drain_max_credentials: int = DEFAULT_DRAIN_MAX_CREDENTIALS
+        self._drain_active_credentials: int = 0
         self._load_custom()
 
     def _load_custom(self) -> None:
@@ -90,6 +106,8 @@ class TypeConfigRegistry:
         removed: list[str] = []
         if drain:
             self._drain_mode = True
+            self._drain_start_time = datetime.now()
+            self._drain_active_credentials = len(self._custom_configs)
             return list(self._custom_configs.keys())
         self._custom_enabled = False
         for k in list(self._custom_configs.keys()):
@@ -98,8 +116,38 @@ class TypeConfigRegistry:
                 removed.append(k)
         return removed
 
+    def check_drain_safety(self) -> None:
+        if not self._drain_mode:
+            return
+        if self._drain_start_time is not None:
+            elapsed = (datetime.now() - self._drain_start_time).total_seconds()
+            if elapsed > self._drain_timeout:
+                self._force_kill_drain(elapsed)
+
+    def _force_kill_drain(self, elapsed_seconds: float) -> None:
+        self._drain_mode = False
+        self._drain_start_time = None
+        for k in list(self._custom_configs.keys()):
+            if k in self._configs:
+                del self._configs[k]
+        raise DrainForcedKillError(
+            f"Drain exceeded timeout ({elapsed_seconds:.0f}s > {self._drain_timeout}s). "
+            f"All {self._drain_active_credentials} custom types force-removed."
+        )
+
+    def register_drain_usage(self, credential_count: int = 1) -> None:
+        if not self._drain_mode:
+            return
+        self._drain_active_credentials += credential_count
+        if self._drain_active_credentials > self._drain_max_credentials:
+            self._force_kill_drain(
+                (datetime.now() - (self._drain_start_time or datetime.now())).total_seconds()
+            )
+
     def reset_drain_mode(self) -> None:
         self._drain_mode = False
+        self._drain_start_time = None
+        self._drain_active_credentials = 0
 
     def get(self, cred_type: str) -> dict[str, int]:
         if cred_type in self._configs:

@@ -649,11 +649,11 @@ class TestNamespaceIsolation:
         assert isolator.hijack_detected
         assert "hacked" in isolator.hijacked_namespaces
 
-    def test_vault_namespace_adapter(self):
+    def test_vault_namespace_adapter(self, tmp_path):
         from credential_rotation.namespace import VaultNamespaceAdapter
         from credential_rotation.vault import FileVaultBackend
 
-        vault = FileVaultBackend()
+        vault = FileVaultBackend(vault_path=tmp_path / "vault.json")
         prod_vault = VaultNamespaceAdapter(vault, namespace="prod")
         staging_vault = VaultNamespaceAdapter(vault, namespace="staging")
         prod_vault.store("cred-001", {"value": "prod-secret"})
@@ -668,11 +668,11 @@ class TestNamespaceIsolation:
         assert len(prod_vault.list_ids()) == 1
         assert "cred-001" in prod_vault.list_ids()
 
-    def test_vault_namespace_cross_access_denied(self):
+    def test_vault_namespace_cross_access_denied(self, tmp_path):
         from credential_rotation.namespace import NamespaceSecurityError, VaultNamespaceAdapter
         from credential_rotation.vault import FileVaultBackend
 
-        vault = FileVaultBackend()
+        vault = FileVaultBackend(vault_path=tmp_path / "vault.json")
         prod_vault = VaultNamespaceAdapter(vault, namespace="prod")
         vault.store("staging::cred-001", {"value": "evil"})
         with pytest.raises(NamespaceSecurityError):
@@ -902,3 +902,282 @@ class TestRotationTemplate:
         vault = FileVaultBackend()
         with pytest.raises(NotImplementedError):
             vault.describe_rotation("test")
+
+
+class TestClockDrift:
+    def test_clock_drift_config_no_drift(self):
+        from credential_rotation.remote import ClockDriftConfig
+
+        config = ClockDriftConfig()
+        now = datetime.now(timezone.utc)
+        remote = now + timedelta(minutes=1)
+        detected, delta = config.check_drift(remote, now)
+        assert not detected
+        assert delta is None
+
+    def test_clock_drift_config_with_drift(self):
+        from credential_rotation.remote import ClockDriftConfig
+
+        config = ClockDriftConfig(tolerance=timedelta(minutes=2))
+        now = datetime.now(timezone.utc)
+        remote = now + timedelta(minutes=10)
+        detected, delta = config.check_drift(remote, now)
+        assert detected
+        assert delta is not None
+        assert delta > timedelta(minutes=2)
+
+    def test_clock_drift_acceptable(self):
+        from credential_rotation.remote import ClockDriftConfig
+
+        config = ClockDriftConfig(max_drift=timedelta(hours=2))
+        assert config.is_drift_acceptable(timedelta(minutes=30))
+        assert not config.is_drift_acceptable(timedelta(hours=3))
+
+    def test_remote_fetch_result_drift_fields(self):
+        from pathlib import Path
+
+        from credential_rotation.remote import RemoteFetchResult
+
+        result = RemoteFetchResult(
+            local_path=Path("/tmp/test.csv"),
+            last_modified=datetime.now(),
+            was_updated=True,
+            clock_drift_detected=True,
+            clock_drift_delta=timedelta(minutes=15),
+        )
+        assert result.clock_drift_detected
+        assert result.clock_drift_delta == timedelta(minutes=15)
+
+
+class TestAzureKeyVaultBackend:
+    def test_azure_in_backends(self):
+        from credential_rotation.vault import VAULT_BACKENDS
+
+        assert "azure" in VAULT_BACKENDS
+
+    def test_azure_import_error(self):
+        from credential_rotation.vault import VAULT_BACKENDS
+
+        cls = VAULT_BACKENDS["azure"]
+        assert cls is not None
+
+
+class TestDrainForceKill:
+    def test_drain_timeout_forces_kill(self):
+        from credential_rotation.models import DrainForcedKillError, TypeConfigRegistry
+
+        registry = TypeConfigRegistry()
+        registry.register("custom_type", rotation_period_days=45, warning_days=10)
+        registry.disable_custom(drain=True)
+        registry._drain_timeout = -1
+        with pytest.raises(DrainForcedKillError):
+            registry.check_drain_safety()
+
+    def test_drain_max_credentials_forces_kill(self):
+        from credential_rotation.models import DrainForcedKillError, TypeConfigRegistry
+
+        registry = TypeConfigRegistry()
+        registry.register("custom_type", rotation_period_days=45, warning_days=10)
+        registry.disable_custom(drain=True)
+        registry._drain_max_credentials = 0
+        with pytest.raises(DrainForcedKillError):
+            registry.register_drain_usage(1)
+
+    def test_drain_within_limits_no_kill(self):
+        registry = TypeConfigRegistry()
+        registry.register("custom_type", rotation_period_days=45, warning_days=10)
+        registry.disable_custom(drain=True)
+        registry.check_drain_safety()
+        registry.register_drain_usage(5)
+        assert registry.drain_mode
+
+
+class TestRruleWeeklyQuarterly:
+    def test_weekly_rrule(self):
+        from credential_rotation.exporter import generate_weekly_rrule
+
+        rrule = generate_weekly_rrule(interval=2, by_day="MO,TH")
+        assert "FREQ=WEEKLY" in rrule
+        assert "INTERVAL=2" in rrule
+        assert "BYDAY=MO,TH" in rrule
+
+    def test_quarterly_rrule(self):
+        from credential_rotation.exporter import generate_quarterly_rrule
+
+        rrule = generate_quarterly_rrule(by_month="1,4,7,10")
+        assert "FREQ=YEARLY" in rrule
+        assert "BYMONTH=1,4,7,10" in rrule
+
+    def test_90_days_rrule_quarterly(self):
+        from credential_rotation.exporter import generate_rrule_from_rotation_days
+
+        rrule = generate_rrule_from_rotation_days(90)
+        assert "BYMONTH=1,4,7,10" in rrule
+
+    def test_composite_recurrence_sample(self):
+        from credential_rotation.exporter import generate_composite_recurrence_sample
+
+        start = datetime(2026, 1, 6, 10, 0, 0)
+        sample = generate_composite_recurrence_sample(start, weekly_interval=2, years=1)
+        assert "weekly_rrule" in sample
+        assert "quarterly_rrule" in sample
+        assert sample["weekly_events"] > 0
+        assert sample["quarterly_events"] > 0
+        assert len(sample["weekly_first_5"]) > 0
+        assert len(sample["quarterly_dates"]) > 0
+
+
+class TestEffectiveUid:
+    def test_euid_detection_setuid_scenario(self):
+        from credential_rotation.vault import IdentityType, detect_identity
+
+        identity = detect_identity()
+        assert identity in (
+            IdentityType.ROOT,
+            IdentityType.REGULAR_USER,
+            IdentityType.SERVICE_ACCOUNT,
+            IdentityType.UNKNOWN,
+        )
+
+    def test_env_file_vault_setuid_warning(self, tmp_path):
+        from credential_rotation.vault import EnvFileVaultBackend, IdentityType
+
+        vault = EnvFileVaultBackend(
+            vault_path=tmp_path / "vault.json",
+            encryption_key="test-key",
+            identity=IdentityType.REGULAR_USER,
+        )
+        assert vault._identity == IdentityType.REGULAR_USER
+
+
+class TestNamespaceKeyRotation:
+    def test_key_rotation_record(self):
+        from credential_rotation.namespace import KeyRotationRecord
+
+        record = KeyRotationRecord(
+            namespace="prod",
+            old_key_hash="abc123",
+            new_key_hash="def456",
+            rotated_at="2026-06-16T00:00:00",
+            rotated_by="admin",
+            affected_credentials=5,
+            reason="key_compromised",
+        )
+        assert record.namespace == "prod"
+        assert record.affected_credentials == 5
+        assert record.reason == "key_compromised"
+
+    def test_key_manager_rotate(self, tmp_path):
+        from credential_rotation.namespace import NamespaceKeyManager
+        from credential_rotation.vault import FileVaultBackend
+
+        vault = FileVaultBackend(vault_path=tmp_path / "vault.json")
+        adapter_ns = "testns"
+        from credential_rotation.namespace import VaultNamespaceAdapter
+
+        adapter = VaultNamespaceAdapter(vault, namespace=adapter_ns)
+        adapter.store("cred-001", {"secret": "test"})
+
+        manager = NamespaceKeyManager(vault, key_store_path=str(tmp_path / "key_rotation.json"))
+        record = manager.rotate_namespace_key(adapter_ns, "old-secret-key", reason="suspected_leak")
+        assert record.namespace == adapter_ns
+        assert record.affected_credentials >= 1
+        assert record.old_key_hash != record.new_key_hash
+
+    def test_key_rotation_history(self, tmp_path):
+        from credential_rotation.namespace import NamespaceKeyManager
+        from credential_rotation.vault import FileVaultBackend
+
+        vault = FileVaultBackend(vault_path=tmp_path / "vault.json")
+        manager = NamespaceKeyManager(
+            vault, key_store_path=str(tmp_path / "key_rotation_hist.json")
+        )
+        from credential_rotation.namespace import VaultNamespaceAdapter
+
+        adapter = VaultNamespaceAdapter(vault, namespace="histns")
+        adapter.store("cred-001", {"secret": "test"})
+        manager.rotate_namespace_key("histns", "key1", reason="test")
+        manager.rotate_namespace_key("histns", "key2", reason="test2")
+        history = manager.get_rotation_history("histns")
+        assert len(history) == 2
+
+    def test_check_key_compromised(self, tmp_path):
+        from credential_rotation.namespace import NamespaceKeyManager
+        from credential_rotation.vault import FileVaultBackend
+
+        vault = FileVaultBackend(vault_path=tmp_path / "vault.json")
+        manager = NamespaceKeyManager(vault, key_store_path=str(tmp_path / "key_compromised.json"))
+        from credential_rotation.namespace import VaultNamespaceAdapter
+
+        adapter = VaultNamespaceAdapter(vault, namespace="compns")
+        adapter.store("cred-001", {"secret": "test"})
+        record = manager.rotate_namespace_key("compns", "compromised-key", reason="leak")
+        matches = manager.check_key_compromised(record.old_key_hash)
+        assert len(matches) >= 1
+        assert matches[0].reason == "leak"
+
+
+class TestDaylightSavingTime:
+    def test_dst_spring_forward_expiry(self):
+        cred = _make_credential(
+            expires_at=datetime(2026, 3, 8, 2, 30, 0),
+            warning_days=14,
+        )
+        before_dst = datetime(2026, 3, 7, 23, 0, 0)
+        after_dst = datetime(2026, 3, 8, 3, 0, 0)
+        assert not cred.is_expired(before_dst)
+        assert cred.is_expired(after_dst)
+
+    def test_dst_fall_back_expiry(self):
+        cred = _make_credential(
+            expires_at=datetime(2026, 11, 1, 1, 30, 0),
+            warning_days=14,
+        )
+        before = datetime(2026, 11, 1, 0, 0, 0)
+        after = datetime(2026, 11, 1, 2, 0, 0)
+        assert not cred.is_expired(before)
+        assert cred.is_expired(after)
+
+    def test_dst_boundary_warning_window(self):
+        cred = _make_credential(
+            expires_at=datetime(2026, 3, 22, 2, 0, 0),
+            warning_days=7,
+        )
+        just_before_warning = datetime(2026, 3, 14, 1, 0, 0)
+        just_after_warning = datetime(2026, 3, 15, 3, 0, 0)
+        days_before = cred.days_until_expiry(just_before_warning)
+        assert days_before > 7 or not cred.is_expiring_soon(just_before_warning)
+        assert cred.is_expiring_soon(just_after_warning)
+
+    def test_dst_cross_timezone_expiry(self):
+        utc_expires = datetime(2026, 3, 8, 7, 0, 0, tzinfo=timezone.utc)
+        cred = _make_credential(expires_at=utc_expires, warning_days=14)
+        est_before = datetime(2026, 3, 8, 1, 59, 0, tzinfo=timezone.utc)
+        est_after = datetime(2026, 3, 8, 7, 1, 0, tzinfo=timezone.utc)
+        assert not cred.is_expired(est_before)
+        assert cred.is_expired(est_after)
+
+    def test_ical_dst_export(self, tmp_path):
+        from credential_rotation.exporter import export_to_ical
+
+        rotation_list = [
+            {
+                "id": "dst-test",
+                "name": "DST Cred",
+                "type": "api_key",
+                "status": "active",
+                "action": "monitor",
+                "expires_at": "2026-03-08T02:30:00",
+                "days_until_expiry": 200,
+                "rotation_period_days": 90,
+                "owner": "",
+                "service": "",
+                "environment": "prod",
+                "conflict": {"has_conflict": False, "conflicting_ids": [], "details": ""},
+            }
+        ]
+        output = tmp_path / "dst_test.ics"
+        export_to_ical(rotation_list, output, timezone_id="America/New_York")
+        content = output.read_text(encoding="utf-8")
+        assert "VCALENDAR" in content
+        assert "America/New_York" in content
