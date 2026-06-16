@@ -1,0 +1,74 @@
+stages:
+  - lint
+  - test
+  - pre-commit
+
+default:
+  image: python:3.12-slim
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+
+cache:
+  paths:
+    - .pip-cache/
+    - .venv/
+
+before_script:
+  - python -V
+  - pip install --upgrade pip
+  - pip install -e ".[dev]"
+
+lint:
+  stage: lint
+  parallel:
+    matrix:
+      - TZ: ["UTC", "Asia/Shanghai", "America/New_York", "Europe/London"]
+  script:
+    - export TZ=$TZ
+    - echo "Running lint with TZ=$TZ"
+    - ruff check credential_rotation/ tests/
+    - ruff format --check credential_rotation/ tests/
+    - mypy credential_rotation/
+  allow_failure:
+    - mypy credential_rotation/
+
+test:
+  stage: test
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.9", "3.10", "3.11", "3.12"]
+        TZ: ["UTC", "Asia/Shanghai", "America/New_York"]
+  image: python:$PYTHON_VERSION-slim
+  script:
+    - export TZ=$TZ
+    - echo "Running tests with Python $PYTHON_VERSION, TZ=$TZ"
+    - pytest tests/ -v --tb=short -m "not remote and not vault_cloud"
+  artifacts:
+    when: always
+    reports:
+      junit: test-results.xml
+    paths:
+      - test-results.xml
+
+test_timezone:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pytest tests/ -v -m "timezone"
+
+test_leap_year:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pytest tests/ -v -m "leap_year"
+
+pre-commit:
+  stage: pre-commit
+  image: python:3.12-slim
+  before_script:
+    - pip install pre-commit
+    - pre-commit install
+  script:
+    - pre-commit run --all-files
+  allow_failure: true

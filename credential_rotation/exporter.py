@@ -1,8 +1,82 @@
 import csv
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+
+def _build_rrule(
+    freq: str = "YEARLY",
+    interval: int = 1,
+    count: Optional[int] = None,
+    until: Optional[datetime] = None,
+    by_month: Optional[int] = None,
+    by_day: Optional[str] = None,
+) -> str:
+    parts = [f"FREQ={freq}", f"INTERVAL={interval}"]
+    if count is not None:
+        parts.append(f"COUNT={count}")
+    if until is not None:
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        parts.append(f"UNTIL={until.strftime('%Y%m%dT%H%M%SZ')}")
+    if by_month is not None:
+        parts.append(f"BYMONTH={by_month}")
+    if by_day is not None:
+        parts.append(f"BYDAY={by_day}")
+    return "RRULE:" + ";".join(parts)
+
+
+def generate_recurring_dates(
+    start_date: datetime,
+    rotation_days: int,
+    max_years: int = 5,
+    end_date: Optional[datetime] = None,
+) -> list[datetime]:
+    dates: list[datetime] = []
+    current = start_date
+    if end_date is None:
+        end_date = start_date.replace(year=start_date.year + max_years)
+    year_end = start_date.year + max_years
+    while current <= end_date and current.year <= year_end:
+        dates.append(current)
+        current = current + timedelta(days=rotation_days)
+    return dates
+
+
+def generate_rrule_from_rotation_days(rotation_days: int) -> str:
+    if rotation_days >= 365 and rotation_days % 365 == 0:
+        years = rotation_days // 365
+        return _build_rrule(freq="YEARLY", interval=years)
+    if rotation_days >= 30 and rotation_days % 30 == 0:
+        months = rotation_days // 30
+        return _build_rrule(freq="MONTHLY", interval=months)
+    if rotation_days >= 7 and rotation_days % 7 == 0:
+        weeks = rotation_days // 7
+        return _build_rrule(freq="WEEKLY", interval=weeks)
+    return _build_rrule(freq="DAILY", interval=rotation_days)
+
+
+def generate_cross_year_recurrence_sample(
+    start_date: datetime,
+    rotation_days: int,
+    years: int = 5,
+) -> dict:
+    dates = generate_recurring_dates(start_date, rotation_days, max_years=years)
+    rrule = generate_rrule_from_rotation_days(rotation_days)
+    by_year: dict[int, int] = {}
+    for d in dates:
+        by_year[d.year] = by_year.get(d.year, 0) + 1
+    return {
+        "start_date": start_date.isoformat(),
+        "rotation_days": rotation_days,
+        "rrule": rrule,
+        "total_events": len(dates),
+        "years_covered": sorted(by_year.keys()),
+        "events_by_year": by_year,
+        "first_5_dates": [d.isoformat() for d in dates[:5]],
+        "last_5_dates": [d.isoformat() for d in dates[-5:]],
+    }
 
 
 def export_to_json(rotation_list: list[dict], output_path: Path) -> Path:
@@ -126,6 +200,8 @@ def export_to_ical(
     rotation_list: list[dict],
     output_path: Path,
     timezone_id: Optional[str] = None,
+    include_rrule: bool = False,
+    rrule_until_years: int = 5,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tzid = timezone_id or "UTC"
@@ -191,6 +267,36 @@ def export_to_ical(
         lines.append(f"DESCRIPTION:{desc_text}")
         lines.append("STATUS:CONFIRMED")
         lines.append("TRANSP:OPAQUE")
+
+        if include_rrule:
+            rotation_days = int(item.get("rotation_period_days", 0))
+            if rotation_days > 0:
+                rrule_until = expires_utc.replace(year=expires_utc.year + rrule_until_years)
+                rrule = _build_rrule(
+                    freq="YEARLY"
+                    if rotation_days >= 365
+                    else "MONTHLY"
+                    if rotation_days >= 30
+                    else "WEEKLY"
+                    if rotation_days >= 7
+                    else "DAILY",
+                    interval=max(
+                        1,
+                        rotation_days
+                        // (
+                            365
+                            if rotation_days >= 365
+                            else 30
+                            if rotation_days >= 30
+                            else 7
+                            if rotation_days >= 7
+                            else 1
+                        ),
+                    ),
+                    until=rrule_until,
+                )
+                lines.append(rrule)
+
         lines.append("BEGIN:VALARM")
         lines.append("TRIGGER:-P14D")
         lines.append("ACTION:DISPLAY")

@@ -46,6 +46,9 @@ CUSTOM_CONFIG_PATH = Path(
 class TypeConfigRegistry:
     def __init__(self):
         self._configs: dict[str, dict[str, int]] = dict(_DEFAULT_TYPE_CONFIGS)
+        self._custom_configs: dict[str, dict[str, int]] = {}
+        self._custom_enabled: bool = True
+        self._drain_mode: bool = False
         self._load_custom()
 
     def _load_custom(self) -> None:
@@ -60,43 +63,91 @@ class TypeConfigRegistry:
                             and "rotation_period_days" in v
                             and "warning_days" in v
                         ):
-                            self._configs[k] = {
+                            cfg = {
                                 "rotation_period_days": int(v["rotation_period_days"]),
                                 "warning_days": int(v["warning_days"]),
                             }
+                            self._custom_configs[k] = cfg
+                            self._configs[k] = cfg
             except Exception:
                 pass
 
+    @property
+    def custom_enabled(self) -> bool:
+        return self._custom_enabled and not self._drain_mode
+
+    @property
+    def drain_mode(self) -> bool:
+        return self._drain_mode
+
+    def enable_custom(self) -> None:
+        if not self._custom_enabled:
+            self._custom_enabled = True
+            for k, v in self._custom_configs.items():
+                self._configs[k] = v
+
+    def disable_custom(self, drain: bool = False) -> list[str]:
+        removed: list[str] = []
+        if drain:
+            self._drain_mode = True
+            return list(self._custom_configs.keys())
+        self._custom_enabled = False
+        for k in list(self._custom_configs.keys()):
+            if k in self._configs:
+                del self._configs[k]
+                removed.append(k)
+        return removed
+
+    def reset_drain_mode(self) -> None:
+        self._drain_mode = False
+
     def get(self, cred_type: str) -> dict[str, int]:
-        return self._configs.get(
-            cred_type,
-            self._configs.get("api_key", {"rotation_period_days": 90, "warning_days": 14}),
-        )
+        if cred_type in self._configs:
+            return self._configs[cred_type]
+        if cred_type in self._custom_configs and self._drain_mode:
+            return self._custom_configs[cred_type]
+        return self._configs.get("api_key", {"rotation_period_days": 90, "warning_days": 14})
+
+    def is_custom_type(self, cred_type: str) -> bool:
+        return cred_type in self._custom_configs
+
+    def is_draining_type(self, cred_type: str) -> bool:
+        return self._drain_mode and self.is_custom_type(cred_type)
 
     def register(self, cred_type: str, rotation_period_days: int, warning_days: int) -> None:
-        self._configs[cred_type] = {
-            "rotation_period_days": rotation_period_days,
-            "warning_days": warning_days,
-        }
+        if self._drain_mode:
+            raise RuntimeError(
+                "Cannot register new types while in drain mode. Call reset_drain_mode() first."
+            )
+        cfg = {"rotation_period_days": rotation_period_days, "warning_days": warning_days}
+        self._custom_configs[cred_type] = cfg
+        if self._custom_enabled:
+            self._configs[cred_type] = cfg
 
     def unregister(self, cred_type: str) -> bool:
-        if cred_type in self._configs and cred_type not in _DEFAULT_TYPE_CONFIGS:
-            del self._configs[cred_type]
+        if cred_type in self._custom_configs:
+            del self._custom_configs[cred_type]
+            if cred_type in self._configs:
+                del self._configs[cred_type]
             return True
         return False
 
     def save_custom(self) -> Path:
-        custom = {k: v for k, v in self._configs.items() if k not in _DEFAULT_TYPE_CONFIGS}
         CUSTOM_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(CUSTOM_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(custom, f, indent=2, ensure_ascii=False)
+            json.dump(self._custom_configs, f, indent=2, ensure_ascii=False)
         return CUSTOM_CONFIG_PATH
 
     def list_all(self) -> dict[str, dict[str, int]]:
         return dict(self._configs)
 
     def list_custom(self) -> dict[str, dict[str, int]]:
-        return {k: v for k, v in self._configs.items() if k not in _DEFAULT_TYPE_CONFIGS}
+        return dict(self._custom_configs)
+
+    def list_draining(self) -> dict[str, dict[str, int]]:
+        if not self._drain_mode:
+            return {}
+        return dict(self._custom_configs)
 
 
 _type_registry = TypeConfigRegistry()

@@ -94,6 +94,7 @@ module = [
     "boto3.*",
     "keyring.*",
     "google.cloud.*",
+    "google.protobuf.*",
     "paramiko.*",
     "rich.*",
     "typer.*",
